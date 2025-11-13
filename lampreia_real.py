@@ -16,16 +16,23 @@ CONCEITO LAMPREIA:
 
 ARQUITETURA ENHANCED:
     [GPT-2]        [DistilBERT]      [RoBERTa]
-       ↓                 ↓                ↓
-   Semantic         Semantic         Semantic
-   Extractor        Extractor        Extractor
-       ↓                 ↓                ↓
-       └─────────────────┴────────────────┘
-                      ↓
-              Multi-Teacher Loss
-                      ↓
-           [ΨQRH Student Model]
-                   (GPU)
+        ↓                 ↓                ↓
+    Semantic         Semantic         Semantic
+    Extractor        Extractor        Extractor
+    ([CLS] token)   ([CLS] token)    ([CLS] token)
+        ↓                 ↓                ↓
+    Projection       Projection       Projection
+    (768→512)       (768→512)        (768→512)
+        ↓                 ↓                ↓
+    Teacher Head     Teacher Head     Teacher Head
+    (512→2)         (512→2)          (512→2)
+        ↓                 ↓                ↓
+        └─────────────────┴────────────────┘
+                       ↓
+               KL Distillation Loss
+                       ↓
+            [ΨQRH Student Model]
+                    (GPU)
 
 Author: Klenio Araujo Padilha
 Compliance: GENUINE MATHEMATICS + MULTI-TEACHER DISTILLATION + PHYSICS-BASED AUTO-REGULATION
@@ -45,7 +52,6 @@ import json
 from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
 from datasets import load_dataset
-from tokenizers import Tokenizer
 from transformers import (
     GPT2Model, GPT2Tokenizer,
     DistilBertModel, DistilBertTokenizer,
@@ -144,6 +150,25 @@ class GPT2SemanticTeacher(SemanticTeacher):
         except:
             return None
 
+    def extract_semantic_embeddings_from_texts(self, texts: List[str]) -> Optional[torch.Tensor]:
+        """Extract semantic embeddings from GPT-2 using its tokenizer"""
+        if self.model is None or self.tokenizer is None:
+            return None
+
+        try:
+            # Tokenize all texts
+            encoded = self.tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
+            input_ids = encoded['input_ids'].to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_ids)
+                # Use [CLS] token (first token)
+                semantic_emb = outputs.last_hidden_state[:, 0]  # [B, hidden_size]
+                return semantic_emb
+        except Exception as e:
+            logging.warning(f"Failed to extract GPT-2 embeddings: {e}")
+            return None
+
 class DistilBERTSemanticTeacher(SemanticTeacher):
     """DistilBERT based semantic teacher"""
 
@@ -175,6 +200,25 @@ class DistilBERTSemanticTeacher(SemanticTeacher):
                 semantic_emb = outputs.last_hidden_state.mean(dim=1)
                 return semantic_emb
         except:
+            return None
+
+    def extract_semantic_embeddings_from_texts(self, texts: List[str]) -> Optional[torch.Tensor]:
+        """Extract semantic embeddings from DistilBERT using its tokenizer"""
+        if self.model is None or self.tokenizer is None:
+            return None
+
+        try:
+            # Tokenize all texts
+            encoded = self.tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
+            input_ids = encoded['input_ids'].to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_ids)
+                # Use [CLS] token (first token)
+                semantic_emb = outputs.last_hidden_state[:, 0]
+                return semantic_emb
+        except Exception as e:
+            logging.warning(f"Failed to extract DistilBERT embeddings: {e}")
             return None
 
 class RoBERTaSemanticTeacher(SemanticTeacher):
@@ -210,6 +254,25 @@ class RoBERTaSemanticTeacher(SemanticTeacher):
         except:
             return None
 
+    def extract_semantic_embeddings_from_texts(self, texts: List[str]) -> Optional[torch.Tensor]:
+        """Extract semantic embeddings from RoBERTa using its tokenizer"""
+        if self.model is None or self.tokenizer is None:
+            return None
+
+        try:
+            # Tokenize all texts
+            encoded = self.tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
+            input_ids = encoded['input_ids'].to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_ids)
+                # Use [CLS] token (first token)
+                semantic_emb = outputs.last_hidden_state[:, 0]
+                return semantic_emb
+        except Exception as e:
+            logging.warning(f"Failed to extract RoBERTa embeddings: {e}")
+            return None
+
 class MultiTeacherSemanticExtractor:
     """Combines multiple teachers for semantic knowledge extraction"""
 
@@ -221,27 +284,27 @@ class MultiTeacherSemanticExtractor:
         logging.info("INITIALIZING MULTI-TEACHER SEMANTIC EXTRACTION SYSTEM")
         logging.info(f"{'='*80}")
 
-        # Initialize teachers on CPU
-        cpu_device = torch.device('cpu')
+        # Initialize teachers on GPU if available for efficiency
+        teacher_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         if 'gpt2' in use_teachers:
-            self.teachers.append(GPT2SemanticTeacher(cpu_device))
+            self.teachers.append(GPT2SemanticTeacher(teacher_device))
 
         if 'distilbert' in use_teachers:
-            self.teachers.append(DistilBERTSemanticTeacher(cpu_device))
+            self.teachers.append(DistilBERTSemanticTeacher(teacher_device))
 
         if 'roberta' in use_teachers:
-            self.teachers.append(RoBERTaSemanticTeacher(cpu_device))
+            self.teachers.append(RoBERTaSemanticTeacher(teacher_device))
 
         logging.info(f"✓ Loaded {len(self.teachers)} teacher models")
         logging.info(f"{'='*80}\n")
 
-    def extract_multi_teacher_embeddings(self, input_ids: torch.Tensor) -> List[torch.Tensor]:
-        """Extract semantic embeddings from all teachers"""
+    def extract_multi_teacher_embeddings(self, texts: List[str]) -> List[torch.Tensor]:
+        """Extract semantic embeddings from all teachers using their own tokenizers"""
         embeddings = []
 
         for teacher in self.teachers:
-            emb = teacher.extract_semantic_embeddings(input_ids)
+            emb = teacher.extract_semantic_embeddings_from_texts(texts)
             if emb is not None:
                 # Move to student device
                 embeddings.append(emb.to(self.student_device))
@@ -420,7 +483,7 @@ class LampreiaStudentModel(nn.Module):
 # DATA LOADING AND AUGMENTATION
 # =============================================================================
 
-def augment_input_ids(input_ids: torch.Tensor, aug_prob: float = 0.1) -> torch.Tensor:
+def augment_input_ids(input_ids: torch.Tensor, aug_prob: float = 0.1, vocab_size: int = 50257) -> torch.Tensor:
     """Data augmentation with token masking and replacement"""
     if torch.rand(1).item() > 0.5:
         augmented = input_ids.clone()
@@ -428,7 +491,7 @@ def augment_input_ids(input_ids: torch.Tensor, aug_prob: float = 0.1) -> torch.T
         augmented[mask] = 0
 
         replace_mask = torch.rand_like(input_ids.float()) < (aug_prob / 2)
-        random_ids = torch.randint(1, 1000, input_ids.shape, device=input_ids.device)
+        random_ids = torch.randint(0, vocab_size, input_ids.shape, device=input_ids.device)
         augmented[replace_mask] = random_ids[replace_mask]
 
         return augmented
@@ -447,7 +510,8 @@ def build_real_glue_data(task: str, split: str, max_samples: int = 2000):
 
     logging.info("Initializing GPT-2 tokenizer...")
     try:
-        tok = Tokenizer.from_pretrained("gpt2")
+        tok = GPT2Tokenizer.from_pretrained("gpt2")
+        tok.pad_token = tok.eos_token
     except Exception as e:
         logging.error(f"Failed to load tokenizer: {e}")
         raise
@@ -475,15 +539,15 @@ def build_real_glue_data(task: str, split: str, max_samples: int = 2000):
             labels.append(item["label"])
 
     def encode(text):
-        ids = tok.encode(text).ids[:128]
-        return ids + [0] * (128 - len(ids))
+        ids = tok.encode(text, add_special_tokens=False)[:128]
+        return ids + [tok.pad_token_id] * (128 - len(ids))
 
-    logging.info(f"Encoding {len(texts)} samples with BPE...")
-    input_ids = torch.tensor([encode(t) for t in texts])
+    logging.info(f"Encoding {len(texts)} samples with GPT-2 tokenizer...")
+    student_input_ids = torch.tensor([encode(t) for t in texts])
     labels = torch.tensor(labels)
 
-    logging.info(f"Dataset built: {input_ids.shape[0]} samples")
-    return input_ids, labels
+    logging.info(f"Dataset built: {student_input_ids.shape[0]} samples")
+    return texts, labels, student_input_ids
 
 # =============================================================================
 # MULTI-TEACHER DISTILLATION TRAINING
@@ -531,7 +595,7 @@ def auto_regulate_distillation_parameters(physics_state: Dict, quality_metrics: 
     return new_alpha_ce, new_alpha_distill, new_temperature
 
 def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExtractor,
-                        task: str, device: torch.device, epochs: int = 10):
+                        task: str, device: torch.device, epochs: int = 10, num_classes: int = 2):
     """Train Lampreia student with multi-teacher distillation"""
 
     logging.info("="*80)
@@ -543,19 +607,19 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
 
     # Load data
     logging.info("\n[1/4] Loading training data...")
-    train_x, train_y = build_real_glue_data(task, "train", 2000)
+    train_texts, train_y, train_x = build_real_glue_data(task, "train", 2000)
 
     logging.info("\n[2/4] Loading validation data...")
-    val_x, val_y = build_real_glue_data(task, "validation", 400)
+    val_texts, val_y, val_x = build_real_glue_data(task, "validation", 400)
 
     train_loader = DataLoader(
-        list(zip(train_x, train_y)),
+        list(zip(train_texts, train_x, train_y)),
         batch_size=32,
         shuffle=True,
         pin_memory=True
     )
     val_loader = DataLoader(
-        list(zip(val_x, val_y)),
+        list(zip(val_texts, val_x, val_y)),
         batch_size=32,
         pin_memory=True
     )
@@ -569,8 +633,15 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
         'roberta': nn.Linear(768, student_dim, device=device)
     })
 
+    # Teacher classification heads for proper KL distillation
+    teacher_heads = nn.ModuleDict({
+        'gpt2': nn.Linear(student_dim, num_classes, device=device),
+        'distilbert': nn.Linear(student_dim, num_classes, device=device),
+        'roberta': nn.Linear(student_dim, num_classes, device=device)
+    })
+
     # Optimizer with HIGHER learning rate and warm-up
-    all_params = list(model.parameters()) + list(teacher_projections.parameters())
+    all_params = list(model.parameters()) + list(teacher_projections.parameters()) + list(teacher_heads.parameters())
     opt = optim.AdamW(all_params, lr=5e-5, weight_decay=0.01, eps=1e-8)  # INCREASED from 2e-5
 
     # Linear warm-up + Cosine Annealing scheduler
@@ -609,6 +680,8 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
     logging.info(f"  Teachers: {len(multi_teacher.teachers)}")
     logging.info(f"  Model Capacity: {student_dim}D with 6 layers (ENHANCED)")
     logging.info(f"  Teacher Projection: 768D → {student_dim}D (trainable)")
+    logging.info(f"  Teacher Heads: {student_dim}D → {num_classes}D (trainable, per teacher)")
+    logging.info(f"  Distillation: KL Divergence with temperature scaling")
     logging.info(f"  Physics-Based Auto-Regulation: ENABLED (NO FIXED WEIGHTS)")
     logging.info(f"  Initial CE Loss Weight: {alpha_ce} (will auto-regulate)")
     logging.info(f"  Initial Distillation Weight: {alpha_distill} (will auto-regulate)")
@@ -626,7 +699,7 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
         model.train()
         total_loss, total_ce_loss, total_distill_loss, n = 0, 0, 0, 0
 
-        for batch_idx, (x, y) in enumerate(train_loader):
+        for batch_idx, (texts_batch, x, y) in enumerate(train_loader):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             # Data augmentation
@@ -641,7 +714,7 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
                     ce_loss = ce_loss_fn(logits, y)
 
                     # Multi-teacher distillation with KL Divergence and temperature scaling
-                    teacher_embeddings = multi_teacher.extract_multi_teacher_embeddings(x)
+                    teacher_embeddings = multi_teacher.extract_multi_teacher_embeddings(texts_batch)
                     distill_loss = torch.tensor(0.0, device=device)
 
                     if len(teacher_embeddings) > 0:
@@ -652,14 +725,12 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
                             # Project teacher embedding to student dimension (768 → 512)
                             teacher_emb_projected = teacher_projections[teacher_name](teacher_emb)
 
-                            # Create soft targets with temperature scaling
-                            # Convert embeddings to logits via a learned projection
-                            teacher_logits = F.linear(teacher_emb_projected, model.classifier.weight, model.classifier.bias)
-                            student_logits = logits
+                            # Generate teacher logits using dedicated head
+                            teacher_logits = teacher_heads[teacher_name](teacher_emb_projected)
 
-                            # Apply temperature scaling
+                            # Apply temperature scaling for soft targets
                             teacher_soft = F.softmax(teacher_logits / temperature, dim=-1)
-                            student_log_soft = F.log_softmax(student_logits / temperature, dim=-1)
+                            student_log_soft = F.log_softmax(logits / temperature, dim=-1)
 
                             # KL Divergence loss (scaled by temperature²)
                             kl_div = F.kl_div(student_log_soft, teacher_soft, reduction='batchmean') * (temperature ** 2)
@@ -682,7 +753,7 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
                 ce_loss = ce_loss_fn(logits, y)
 
                 # Multi-teacher distillation with KL Divergence and temperature scaling
-                teacher_embeddings = multi_teacher.extract_multi_teacher_embeddings(x)
+                teacher_embeddings = multi_teacher.extract_multi_teacher_embeddings(texts_batch)
                 distill_loss = torch.tensor(0.0, device=device)
 
                 if len(teacher_embeddings) > 0:
@@ -692,13 +763,12 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
                         # Project teacher embedding to student dimension (768 → 512)
                         teacher_emb_projected = teacher_projections[teacher_name](teacher_emb)
 
-                        # Create soft targets with temperature scaling
-                        teacher_logits = F.linear(teacher_emb_projected, model.classifier.weight, model.classifier.bias)
-                        student_logits = logits
+                        # Generate teacher logits using dedicated head
+                        teacher_logits = teacher_heads[teacher_name](teacher_emb_projected)
 
-                        # Apply temperature scaling
+                        # Apply temperature scaling for soft targets
                         teacher_soft = F.softmax(teacher_logits / temperature, dim=-1)
-                        student_log_soft = F.log_softmax(student_logits / temperature, dim=-1)
+                        student_log_soft = F.log_softmax(logits / temperature, dim=-1)
 
                         # KL Divergence loss (scaled by temperature²)
                         kl_div = F.kl_div(student_log_soft, teacher_soft, reduction='batchmean') * (temperature ** 2)
@@ -736,7 +806,7 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
         correct, total = 0, 0
 
         with torch.no_grad():
-            for x, y in val_loader:
+            for _, x, y in val_loader:
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 logits, _ = model(x)
                 preds = logits.argmax(-1)
@@ -810,6 +880,11 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
             }
         })
 
+    # Save the trained student model
+    model_path = f'lampreia_student_{task}_final.pth'
+    torch.save(model.state_dict(), model_path)
+    logging.info(f"✓ Saved trained student model to {model_path}")
+
     return results
 
 # =============================================================================
@@ -852,7 +927,7 @@ def main():
     # Initialize multi-teacher system
     multi_teacher = MultiTeacherSemanticExtractor(
         student_device=device,
-        use_teachers=['gpt2']  # Start with GPT-2, can add 'distilbert', 'roberta'
+        use_teachers=['gpt2', 'distilbert', 'roberta']  # All three teachers for better distillation
     )
 
     # GLUE tasks
@@ -880,7 +955,7 @@ def main():
         model = GPUOptimizer.optimize_model_for_gpu(model)
 
         # Train with multi-teacher distillation
-        results = train_lampreia_glue(model, multi_teacher, task, device, epochs=10)
+        results = train_lampreia_glue(model, multi_teacher, task, device, epochs=10, num_classes=num_classes)
 
         all_results[task] = results
 
