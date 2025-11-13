@@ -1,0 +1,39 @@
+\babel@toc {english}{}\relax 
+\contentsline {section}{\numberline {1}Introduction}{5}{section.1}%
+\contentsline {subsection}{\numberline {1.1}Lampreia Concept: Multi-Teacher Semantic Extraction}{5}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}Architecture Overview}{5}{subsection.1.2}%
+\contentsline {section}{\numberline {2}Mathematical Framework}{5}{section.2}%
+\contentsline {subsection}{\numberline {2.1}ΨQRH Student Architecture}{5}{subsection.2.1}%
+\contentsline {subsubsection}{\numberline {2.1.1}Prime-Based Harmonic Embeddings}{5}{subsubsection.2.1.1}%
+\contentsline {subsubsection}{\numberline {2.1.2}Spectral Attention Mechanism}{6}{subsubsection.2.1.2}%
+\contentsline {subsection}{\numberline {2.2}Multi-Teacher Semantic Distillation}{6}{subsection.2.2}%
+\contentsline {subsubsection}{\numberline {2.2.1}Semantic Extraction}{6}{subsubsection.2.2.1}%
+\contentsline {subsubsection}{\numberline {2.2.2}Distillation Loss}{6}{subsubsection.2.2.2}%
+\contentsline {section}{\numberline {3}Implementation}{6}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Multi-Teacher System}{6}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}ΨQRH Student Model}{6}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Training Pipeline}{6}{subsection.3.3}%
+\contentsline {section}{\numberline {4}Experimental Results}{6}{section.4}%
+\contentsline {subsection}{\numberline {4.1}GLUE Benchmark Performance}{6}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Efficiency Metrics}{7}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Ablation Studies}{7}{subsection.4.3}%
+\contentsline {section}{\numberline {5}Key Features}{7}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Genuine ΨQRH Mathematics}{7}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Multi-Teacher Distillation}{7}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}Hardware Optimization}{8}{subsection.5.3}%
+\contentsline {section}{\numberline {6}Validation and Testing}{8}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Comprehensive Test Suite}{8}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Statistical Validation}{8}{subsection.6.2}%
+\contentsline {section}{\numberline {7}Limitations and Future Work}{8}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Current Limitations}{8}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Future Enhancements}{8}{subsection.7.2}%
+\contentsline {section}{\numberline {8}Conclusion}{9}{section.8}%
+\contentsline {section}{\numberline {A}Installation and Usage}{9}{appendix.A}%
+\contentsline {subsection}{\numberline {A.1}System Requirements}{9}{subsection.A.1}%
+\contentsline {subsection}{\numberline {A.2}Quick Start}{9}{subsection.A.2}%
+\contentsline {subsection}{\numberline {A.3}Advanced Configuration}{9}{subsection.A.3}%
+\contentsline {section}{\numberline {B}Architecture Details}{9}{appendix.B}%
+\contentsline {subsection}{\numberline {B.1}Teacher Models}{9}{subsection.B.1}%
+\contentsline {subsection}{\numberline {B.2}Student Components}{9}{subsection.B.2}%
+\contentsline {section}{\numberline {C}Performance Benchmarks}{10}{appendix.C}%
+\contentsline {subsection}{\numberline {C.1}Detailed Results}{10}{subsection.C.1}%

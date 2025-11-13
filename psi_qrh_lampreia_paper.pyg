@@ -1,0 +1,11 @@
+# Custom teacher selection
+multi_teacher = MultiTeacherSemanticExtractor(
+    use_teachers=['gpt2', 'roberta']
+)
+
+# Compact student model
+student = LampreiaStudentModel(
+    d_model=128,
+    n_layers=2,
+    max_seq_len=64
+)
