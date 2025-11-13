@@ -326,10 +326,13 @@ class LampreiaStudentModel(nn.Module):
         # ΨQRH Components
         self.prime_system = PhysicalHarmonicResonanceSystem(device=self.device)
 
+        # Learnable token embeddings for better semantic alignment
+        self.token_embeddings = nn.Embedding(vocab_size, d_model, device=self.device)
+
         # Positional embeddings
         self.pos_embedding = nn.Parameter(torch.randn(max_seq_len, d_model, device=self.device))
 
-        # Spectral Attention layers
+        # Enhanced Spectral Attention layers with residual connections
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             layer = nn.ModuleDict({
@@ -371,7 +374,10 @@ class LampreiaStudentModel(nn.Module):
 
         input_ids = input_ids.to(self.device)
 
-        # Create embeddings with prime harmonic resonance
+        # Learnable token embeddings for semantic understanding
+        x_base = self.token_embeddings(input_ids)
+
+        # Enhanced harmonic resonance embeddings
         token_floats = input_ids.float() / self.vocab_size
 
         embeddings_list = []
@@ -383,8 +389,11 @@ class LampreiaStudentModel(nn.Module):
             emb_dim = torch.sin(angle) + torch.cos(angle)
             embeddings_list.append(emb_dim)
 
-        x = torch.stack(embeddings_list, dim=-1)
-        x = F.normalize(x, p=2, dim=-1) * math.sqrt(self.d_model)
+        x_harmonic = torch.stack(embeddings_list, dim=-1)
+        x_harmonic = F.normalize(x_harmonic, p=2, dim=-1) * math.sqrt(self.d_model)
+
+        # Combine learnable and harmonic embeddings for better semantic representation
+        x = x_base + 0.1 * x_harmonic  # Small harmonic modulation
 
         # Add positional embeddings
         x = x + self.pos_embedding[:T, :]
@@ -480,35 +489,6 @@ def build_real_glue_data(task: str, split: str, max_samples: int = 2000):
 # MULTI-TEACHER DISTILLATION TRAINING
 # =============================================================================
 
-def calculate_physics_based_training_quality(logits: torch.Tensor, targets: torch.Tensor,
-                                           distill_loss: torch.Tensor, ce_loss: torch.Tensor) -> Dict[str, float]:
-    """
-    Calculate physics-based training quality metrics for auto-regulation.
-
-    This implements the physics-based quality assessment that drives parameter
-    auto-regulation during distillation training.
-    """
-    # Calculate prediction accuracy
-    preds = logits.argmax(-1)
-    accuracy = (preds == targets).float().mean().item()
-
-    # Calculate loss stability (lower variance = more stable)
-    loss_stability = 1.0 / (1.0 + ce_loss.item() + distill_loss.item())
-
-    # Calculate gradient flow quality (based on loss magnitudes)
-    ce_weight = 1.0 / (1.0 + ce_loss.item())
-    distill_weight = 1.0 / (1.0 + distill_loss.item())
-
-    # Overall quality combines accuracy, stability, and balanced loss contributions
-    quality = (accuracy * 0.4 + loss_stability * 0.3 + (ce_weight + distill_weight) * 0.15)
-
-    return {
-        'accuracy': accuracy,
-        'loss_stability': loss_stability,
-        'ce_weight': ce_weight,
-        'distill_weight': distill_weight,
-        'overall_quality': quality
-    }
 
 def auto_regulate_distillation_parameters(physics_state: Dict, quality_metrics: Dict,
                                         current_alpha_ce: float, current_alpha_distill: float,
@@ -767,12 +747,18 @@ def train_lampreia_glue(model: nn.Module, multi_teacher: MultiTeacherSemanticExt
         epoch_time = time.time() - epoch_start
 
         # PHYSICS-BASED QUALITY ASSESSMENT AND AUTO-REGULATION
-        # Calculate training quality metrics for this epoch
-        avg_ce_loss = torch.tensor(train_ce_loss)
-        avg_distill_loss = torch.tensor(train_distill_loss)
-        quality_metrics = calculate_physics_based_training_quality(
-            logits.detach(), y, avg_distill_loss, avg_ce_loss
-        )
+        # Calculate training quality metrics based on validation performance and loss stability
+        quality_metrics = {
+            'accuracy': acc,  # Use validation accuracy
+            'loss_stability': 1.0 / (1.0 + train_loss),  # Training loss stability
+            'ce_weight': 1.0 / (1.0 + train_ce_loss),  # CE loss contribution
+            'distill_weight': 1.0 / (1.0 + train_distill_loss),  # Distillation loss contribution
+            'overall_quality': (acc * 0.6 + (1.0 / (1.0 + train_loss)) * 0.2 +
+                              (1.0 / (1.0 + train_ce_loss) + 1.0 / (1.0 + train_distill_loss)) * 0.1)
+        }
+
+        # Enhanced quality threshold for better regulation
+        quality_threshold = 0.55  # Require >55% accuracy for positive regulation
 
         # Update physics state
         physics_state['epoch'] = epoch + 1
