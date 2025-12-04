@@ -1,15 +1,20 @@
-
 #!/usr/bin/env python3
 """
-ΨQRH LAMPREIA 3.1 - OPTIMIZED MULTI-TEACHER DISTILLATION
-=================================================================================
+LAMPREIA - Multi-Teacher Knowledge Distillation (Corrected)
+============================================================
+Self-contained implementation for SST-2 sentiment classification.
 
-ENHANCEMENTS:
-1. Better teacher head initialization
-2. Improved learning rate scheduling
-3. Enhanced parameter regulation
-4. Better data preprocessing
-5. More stable training dynamics
+Fixes applied:
+1. All dependencies included (no external lampreia8 imports)
+2. Scheduler calculates steps_per_epoch dynamically
+3. Clear parameter regulation logic
+4. Proper tokenizer handling
+5. Flexible model size configuration
+
+Usage:
+    python lampreia_corrected.py --params 10.5
+    python lampreia_corrected.py --params 8  
+    python lampreia_corrected.py --params 15
 """
 
 import torch
@@ -23,323 +28,439 @@ import logging
 import time
 import sys
 import json
+import argparse
 from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
-from datasets import load_dataset
-from transformers import (
-    GPT2Model, GPT2Tokenizer,
-    DistilBertModel, DistilBertTokenizer,
-    RobertaModel, RobertaTokenizer,
-    AutoModel, AutoTokenizer
-)
+
 try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    HAS_MATPLOTLIB = True
+    from datasets import load_dataset
+    from transformers import (GPT2Model, GPT2Tokenizer, DistilBertModel, 
+                              DistilBertTokenizer, RobertaModel, RobertaTokenizer)
+    HAS_HF = True
 except ImportError:
-    HAS_MATPLOTLIB = False
+    HAS_HF = False
+    print("Warning: Install with: pip install transformers datasets")
 
-import unittest
 
-# =============================================================================
-# ENHANCED MULTI-TEACHER SYSTEM WITH BETTER INITIALIZATION
-# =============================================================================
+@dataclass
+class ModelConfig:
+    """Model configuration based on target parameter count"""
+    d_model: int
+    n_layers: int
+    n_heads: int
+    d_ff_mult: int
+    dropout: float
+    
+    @classmethod
+    def from_param_count(cls, target_millions: float) -> 'ModelConfig':
+        # Configurations tuned for different parameter counts
+        configs = {
+            8: (320, 4, 4, 3, 0.1),
+            10.5: (384, 4, 6, 3, 0.1),
+            15: (448, 5, 8, 3, 0.1),
+        }
+        closest = min(configs.keys(), key=lambda x: abs(x - target_millions))
+        d_model, n_layers, n_heads, d_ff_mult, dropout = configs[closest]
+        return cls(d_model=d_model, n_layers=n_layers, n_heads=n_heads, 
+                   d_ff_mult=d_ff_mult, dropout=dropout)
 
-class EnhancedMultiTeacherExtractor(nn.Module):
-    """Enhanced multi-teacher system with better initialization and training"""
 
-    def __init__(self, student_device: torch.device, use_teachers: List[str] = ['gpt2', 'distilbert', 'roberta']):
+class GPUOptimizer:
+    @staticmethod
+    def get_device() -> torch.device:
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    @staticmethod
+    def clear_cache():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    @staticmethod
+    def memory_info() -> Dict[str, Any]:
+        if not torch.cuda.is_available():
+            return {'device': 'cpu'}
+        return {
+            'device': torch.cuda.get_device_name(0),
+            'total_gb': torch.cuda.get_device_properties(0).total_memory / 1e9,
+        }
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
-        self.student_device = student_device
-        self.teachers = nn.ModuleList()
-
-        logging.info(f"\n{'='*80}")
-        logging.info("INITIALIZING ENHANCED MULTI-TEACHER SYSTEM 3.1")
-        logging.info(f"{'='*80}")
-
-        teacher_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        if 'gpt2' in use_teachers:
-            self.teachers.append(GPT2TeacherWithHead(teacher_device))
-
-        if 'distilbert' in use_teachers:
-            self.teachers.append(DistilBERTTeacherWithHead(teacher_device))
-
-        if 'roberta' in use_teachers:
-            self.teachers.append(RoBERTaTeacherWithHead(teacher_device))
-
-        # Initialize teacher heads with better weights
-        self._initialize_teacher_heads()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = math.sqrt(self.d_head)
         
-        logging.info(f"✓ Loaded {len(self.teachers)} teacher models with optimized heads")
-        logging.info(f"{'='*80}\n")
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
+        q = self.q_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        
+        attn = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.out_proj(out)
 
-    def _initialize_teacher_heads(self):
-        """Initialize teacher classification heads with better weights"""
-        for teacher in self.teachers:
-            if hasattr(teacher, 'classification_head'):
-                nn.init.xavier_uniform_(teacher.classification_head.weight)
-                if teacher.classification_head.bias is not None:
-                    nn.init.zeros_(teacher.classification_head.bias)
 
-    def forward(self, texts: List[str]) -> Optional[torch.Tensor]:
-        """Enhanced forward with confidence-based weighting"""
-        teacher_probs_list = []
-        teacher_confidences = []
-
-        for teacher in self.teachers:
-            logits = teacher(texts)
-            if logits is not None:
-                probs = F.softmax(logits, dim=-1)
-                confidence = torch.max(probs, dim=-1)[0].mean().item()
-                teacher_confidences.append(confidence)
-                teacher_probs_list.append(probs.to(self.student_device))
-
-        if len(teacher_probs_list) == 0:
-            return None
-
-        # Confidence-weighted averaging
-        if len(teacher_probs_list) > 1:
-            weights = torch.tensor(teacher_confidences, device=self.student_device)
-            weights = F.softmax(weights, dim=0)
-            weighted_probs = torch.stack([w * p for w, p in zip(weights, teacher_probs_list)])
-            return weighted_probs.sum(dim=0)
-        else:
-            return teacher_probs_list[0]
-
-# =============================================================================
-# ENHANCED STUDENT MODEL WITH BETTER OPTIMIZATION
-# =============================================================================
-
-class EnhancedLampreiaStudentModel(nn.Module):
-    """
-    Enhanced ΨQRH Student Model 3.1
-    - Better initialization
-    - Improved architecture
-    - More stable training
-    """
-
-    def __init__(self, vocab_size: int = 50257, d_model: int = 384, 
-                 n_layers: int = 4, num_classes: int = 2, max_seq_len: int = 128,
-                 device: torch.device = None):
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, n_heads, dropout)
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model), nn.Dropout(dropout)
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x))
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
 
-        self.vocab_size = vocab_size
-        self.d_model = d_model
+
+class StudentModel(nn.Module):
+    """Student transformer model for distillation"""
+    
+    def __init__(self, config: ModelConfig, vocab_size: int = 50257, 
+                 max_seq_len: int = 128, num_classes: int = 2):
+        super().__init__()
         self.max_seq_len = max_seq_len
-        self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        logging.info(f"Initializing Enhanced ΨQRH Lampreia Student Model 3.1 on {self.device}")
-
-        # Enhanced embeddings with better initialization
-        self.token_embeddings = nn.Embedding(vocab_size, d_model, device=self.device)
-        nn.init.normal_(self.token_embeddings.weight, mean=0.0, std=0.02)
         
-        self.pos_embedding = nn.Parameter(torch.randn(max_seq_len, d_model, device=self.device))
-        nn.init.normal_(self.pos_embedding, mean=0.0, std=0.02)
-
-        # Enhanced layers with better normalization
-        self.layers = nn.ModuleList()
-        for i in range(n_layers):
-            layer = nn.ModuleDict({
-                'attention_norm': nn.LayerNorm(d_model, device=self.device),
-                'ffn_norm': nn.LayerNorm(d_model, device=self.device),
-                'attention': SpectralAttentionGPU(d_model, n_heads=4, device=self.device),
-                'ffn': nn.Sequential(
-                    nn.Linear(d_model, 2*d_model, device=self.device),
-                    nn.GELU(),
-                    nn.Dropout(0.1),
-                    nn.Linear(2*d_model, d_model, device=self.device),
-                    nn.Dropout(0.1)
-                )
-            })
-            self.layers.append(layer)
-
-        # Enhanced classifier
-        self.pre_classifier = nn.Linear(d_model, d_model, device=self.device)
-        self.classifier = nn.Linear(d_model, num_classes, device=self.device)
-        self.dropout = nn.Dropout(0.1)
-
-        # Enhanced initialization
-        self.apply(self._init_weights)
-
+        self.token_emb = nn.Embedding(vocab_size, config.d_model)
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, config.d_model))
+        self.emb_dropout = nn.Dropout(config.dropout)
+        
+        d_ff = config.d_model * config.d_ff_mult
+        self.layers = nn.ModuleList([
+            TransformerBlock(config.d_model, config.n_heads, d_ff, config.dropout)
+            for _ in range(config.n_layers)
+        ])
+        
+        self.final_norm = nn.LayerNorm(config.d_model)
+        self.classifier = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model), nn.Tanh(),
+            nn.Dropout(config.dropout), nn.Linear(config.d_model, num_classes)
+        )
+        
+        self._init_weights()
         total_params = sum(p.numel() for p in self.parameters())
-        logging.info(f"Enhanced ΨQRH Lampreia Student Model: {total_params:,} parameters")
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.zeros_(module.bias)
-            nn.init.ones_(module.weight)
-
+        logging.info(f"Student Model: {total_params:,} params ({total_params/1e6:.2f}M)")
+        
+    def _init_weights(self):
+        nn.init.normal_(self.token_emb.weight, std=0.02)
+        nn.init.normal_(self.pos_emb, std=0.02)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+    
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
         if T > self.max_seq_len:
             input_ids = input_ids[:, :self.max_seq_len]
             T = self.max_seq_len
-
-        input_ids = input_ids.to(self.device)
-
-        # Token embeddings
-        x = self.token_embeddings(input_ids)
         
-        # Add positional embeddings
-        x = x + self.pos_embedding[:T, :]
-
-        # Transformer layers
+        x = self.token_emb(input_ids) + self.pos_emb[:, :T, :]
+        x = self.emb_dropout(x)
+        
         for layer in self.layers:
-            # Attention with residual
-            residual = x
-            x = layer['attention_norm'](x)
-            x = layer['attention'](x)
-            x = residual + x
-
-            # FFN with residual
-            residual = x
-            x = layer['ffn_norm'](x)
-            x = layer['ffn'](x)
-            x = residual + x
-
-        # Enhanced classification
-        x_pooled = x.mean(dim=1)
-        x_pooled = self.pre_classifier(x_pooled)
-        x_pooled = torch.tanh(x_pooled)
-        x_pooled = self.dropout(x_pooled)
-        logits = self.classifier(x_pooled)
-
-        return logits
-
-# =============================================================================
-# ENHANCED TRAINER WITH BETTER OPTIMIZATION
-# =============================================================================
-
-class EnhancedLampreiaTrainer:
-    """Enhanced trainer with better optimization and stability"""
-
-    def __init__(self, model: nn.Module, multi_teacher: EnhancedMultiTeacherExtractor,
-                 distillation_loss: LampreiaDistillationLoss, device: torch.device,
-                 lr: float = 3e-5, weight_decay: float = 0.01, epochs: int = 20,
-                 patience: int = 5, gradient_accumulation_steps: int = 4):
+            x = layer(x)
         
+        x = self.final_norm(x)
+        return self.classifier(x.mean(dim=1))
+
+
+class BaseTeacher(nn.Module):
+    def __init__(self, device: torch.device):
+        super().__init__()
+        self.device = device
+        
+    def _tokenize(self, texts: List[str], max_length: int = 128):
+        enc = self.tokenizer(texts, padding=True, truncation=True, 
+                             max_length=max_length, return_tensors='pt')
+        return {k: v.to(self.device) for k, v in enc.items()}
+    
+    def _init_classifier(self):
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+
+class GPT2Teacher(BaseTeacher):
+    def __init__(self, device: torch.device):
+        super().__init__(device)
+        logging.info("Loading GPT-2 teacher...")
+        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model = GPT2Model.from_pretrained('gpt2').to(device).eval()
+        for p in self.model.parameters(): p.requires_grad = False
+        
+        hs = self.model.config.hidden_size
+        self.classifier = nn.Sequential(
+            nn.Linear(hs, hs // 2), nn.ReLU(), nn.Dropout(0.1), nn.Linear(hs // 2, 2)
+        ).to(device)
+        self._init_classifier()
+        logging.info(f"  GPT-2: {sum(p.numel() for p in self.model.parameters()):,} params")
+    
+    @torch.no_grad()
+    def forward(self, texts: List[str]) -> torch.Tensor:
+        inputs = self._tokenize(texts)
+        out = self.model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'])
+        mask = inputs['attention_mask'].unsqueeze(-1)
+        pooled = (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1)
+        return self.classifier(pooled)
+
+
+class DistilBERTTeacher(BaseTeacher):
+    def __init__(self, device: torch.device):
+        super().__init__(device)
+        logging.info("Loading DistilBERT teacher...")
+        self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+        self.model = DistilBertModel.from_pretrained('distilbert-base-uncased').to(device).eval()
+        for p in self.model.parameters(): p.requires_grad = False
+        
+        hs = self.model.config.hidden_size
+        self.classifier = nn.Sequential(
+            nn.Linear(hs, hs // 2), nn.ReLU(), nn.Dropout(0.1), nn.Linear(hs // 2, 2)
+        ).to(device)
+        self._init_classifier()
+        logging.info(f"  DistilBERT: {sum(p.numel() for p in self.model.parameters()):,} params")
+    
+    @torch.no_grad()
+    def forward(self, texts: List[str]) -> torch.Tensor:
+        inputs = self._tokenize(texts)
+        out = self.model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'])
+        return self.classifier(out.last_hidden_state[:, 0, :])
+
+
+class RoBERTaTeacher(BaseTeacher):
+    def __init__(self, device: torch.device):
+        super().__init__(device)
+        logging.info("Loading RoBERTa teacher...")
+        self.tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+        self.model = RobertaModel.from_pretrained('roberta-base').to(device).eval()
+        for p in self.model.parameters(): p.requires_grad = False
+        
+        hs = self.model.config.hidden_size
+        self.classifier = nn.Sequential(
+            nn.Linear(hs, hs // 2), nn.ReLU(), nn.Dropout(0.1), nn.Linear(hs // 2, 2)
+        ).to(device)
+        self._init_classifier()
+        logging.info(f"  RoBERTa: {sum(p.numel() for p in self.model.parameters()):,} params")
+    
+    @torch.no_grad()
+    def forward(self, texts: List[str]) -> torch.Tensor:
+        inputs = self._tokenize(texts)
+        out = self.model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'])
+        return self.classifier(out.last_hidden_state[:, 0, :])
+
+
+class TeacherEnsemble(nn.Module):
+    """Ensemble of teacher models with confidence-based weighting"""
+    
+    def __init__(self, device: torch.device, teachers: List[str] = None):
+        super().__init__()
+        self.device = device
+        teachers = teachers or ['gpt2', 'distilbert', 'roberta']
+        
+        logging.info("="*60)
+        logging.info("INITIALIZING TEACHER ENSEMBLE")
+        logging.info("="*60)
+        
+        self.teachers = nn.ModuleDict()
+        if 'gpt2' in teachers: self.teachers['gpt2'] = GPT2Teacher(device)
+        if 'distilbert' in teachers: self.teachers['distilbert'] = DistilBERTTeacher(device)
+        if 'roberta' in teachers: self.teachers['roberta'] = RoBERTaTeacher(device)
+        
+        logging.info(f"Loaded {len(self.teachers)} teachers")
+        logging.info("="*60)
+    
+    def get_trainable_params(self):
+        params = []
+        for t in self.teachers.values():
+            params.extend(t.classifier.parameters())
+        return params
+    
+    @torch.no_grad()
+    def forward(self, texts: List[str]) -> Optional[torch.Tensor]:
+        all_probs, all_conf = [], []
+        
+        for name, teacher in self.teachers.items():
+            try:
+                logits = teacher(texts)
+                probs = F.softmax(logits, dim=-1)
+                entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
+                conf = 1.0 / (1.0 + entropy.mean().item())
+                all_probs.append(probs)
+                all_conf.append(conf)
+            except Exception as e:
+                logging.warning(f"Teacher {name} failed: {e}")
+        
+        if not all_probs: return None
+        if len(all_probs) == 1: return all_probs[0]
+        
+        weights = F.softmax(torch.tensor(all_conf, device=self.device), dim=0)
+        return sum(w * p for w, p in zip(weights, all_probs))
+
+
+class DistillationLoss(nn.Module):
+    """Combined loss for knowledge distillation"""
+    
+    def __init__(self):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss()
+        self.kl = nn.KLDivLoss(reduction='batchmean')
+    
+    def forward(self, student_logits, teacher_probs, labels, alpha=0.5, temp=2.0):
+        ce_loss = self.ce(student_logits, labels)
+        
+        student_soft = F.log_softmax(student_logits / temp, dim=-1)
+        teacher_soft = torch.pow(teacher_probs, 1/temp)
+        teacher_soft = teacher_soft / teacher_soft.sum(dim=-1, keepdim=True)
+        
+        kl_loss = self.kl(student_soft, teacher_soft) * (temp ** 2)
+        total = alpha * ce_loss + (1 - alpha) * kl_loss
+        
+        return total, ce_loss, kl_loss
+
+
+class SST2Dataset(Dataset):
+    def __init__(self, texts, input_ids, labels):
+        self.texts, self.input_ids, self.labels = texts, input_ids, labels
+    def __len__(self): return len(self.texts)
+    def __getitem__(self, idx): return self.texts[idx], self.input_ids[idx], self.labels[idx]
+
+
+def load_sst2_data(split: str, max_samples: Optional[int] = None, max_seq_len: int = 128):
+    """Load SST-2 dataset"""
+    logging.info(f"Loading SST-2 {split}...")
+    ds = load_dataset("glue", "sst2", split=split)
+    
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    texts, labels = [], []
+    for idx, item in enumerate(ds):
+        if max_samples and idx >= max_samples: break
+        texts.append(' '.join(item['sentence'].split()))
+        labels.append(item['label'])
+    
+    def encode(text):
+        ids = tokenizer.encode(text, add_special_tokens=True, max_length=max_seq_len, truncation=True)
+        if len(ids) < max_seq_len:
+            ids = ids + [tokenizer.pad_token_id] * (max_seq_len - len(ids))
+        return ids[:max_seq_len]
+    
+    input_ids = torch.tensor([encode(t) for t in texts])
+    labels_tensor = torch.tensor(labels)
+    logging.info(f"  Loaded {len(texts)} samples")
+    return texts, input_ids, labels_tensor
+
+
+class Trainer:
+    """Trainer with dynamic scheduler and parameter regulation"""
+    
+    def __init__(self, model, teachers, device, lr=3e-5, epochs=20, patience=5, grad_accum=4):
         self.model = model
-        self.multi_teacher = multi_teacher
-        self.distillation_loss = distillation_loss
+        self.teachers = teachers
         self.device = device
         self.epochs = epochs
         self.patience = patience
-
-        # Enhanced optimizer with better settings
-        self.optimizer = optim.AdamW(
-            model.parameters(), 
-            lr=lr, 
-            weight_decay=weight_decay, 
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
-
-        # Enhanced learning rate scheduler
-        self.scheduler = optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=lr,
-            epochs=epochs,
-            steps_per_epoch=313,  # 10000 samples / 32 batch size
-            pct_start=0.1,
-            anneal_strategy='cos'
-        )
-
-        # Mixed precision
-        self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+        self.grad_accum = grad_accum
+        
+        self.loss_fn = DistillationLoss()
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+        
+        teacher_params = list(teachers.get_trainable_params())
+        self.teacher_opt = optim.AdamW(teacher_params, lr=lr * 0.1) if teacher_params else None
+        
+        self.scheduler = None
+        self.base_lr = lr
+        
         self.use_amp = torch.cuda.is_available()
-
-        # Enhanced parameter regulation
-        self.alpha_ce = 0.7  # Start with more distillation focus
-        self.temperature = 3.0  # Higher initial temperature
-
-        # Early stopping
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+        
+        self.alpha = 0.7
+        self.temperature = 3.0
         self.best_acc = 0.0
         self.patience_counter = 0
-        self.best_model_state = None
-
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-
-        # Enhanced training history
-        self.history = {
-            'epoch': [], 'train_loss': [], 'train_ce_loss': [], 'train_distill_loss': [],
-            'val_accuracy': [], 'alpha_ce': [], 'temperature': [], 'lr': []
-        }
-
-    def enhanced_auto_regulate(self, quality_metrics: Dict[str, float]) -> Tuple[float, float]:
-        """Enhanced parameter regulation based on training dynamics"""
-        val_acc = quality_metrics.get('val_accuracy', 0.0)
-        train_loss = quality_metrics.get('train_loss', 1.0)
+        self.best_state = None
         
-        # More dynamic alpha_ce regulation
-        if val_acc > 0.75:
-            new_alpha_ce = max(0.5, self.alpha_ce - 0.05)  # More distillation when doing well
-        elif val_acc < 0.6:
-            new_alpha_ce = min(0.9, self.alpha_ce + 0.03)  # More CE when struggling
+        self.history = {'epoch': [], 'train_loss': [], 'val_acc': [], 'alpha': [], 'temp': []}
+    
+    def setup_scheduler(self, steps_per_epoch: int):
+        """Configure scheduler with correct total steps"""
+        total_steps = steps_per_epoch * self.epochs
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer, max_lr=self.base_lr, total_steps=total_steps,
+            pct_start=0.1, anneal_strategy='cos'
+        )
+        logging.info(f"Scheduler: {total_steps} total steps")
+    
+    def adjust_params(self, val_acc: float):
+        """Adjust distillation parameters based on performance"""
+        if val_acc > 0.80:
+            self.alpha = max(0.4, self.alpha - 0.05)
+            self.temperature = max(1.5, self.temperature - 0.2)
+        elif val_acc > 0.70:
+            self.alpha = 0.5 + 0.1 * (0.8 - val_acc) / 0.1
+            self.temperature = max(2.0, self.temperature - 0.1)
         else:
-            # Gradual shift toward distillation
-            progress = min(1.0, val_acc / 0.8)
-            new_alpha_ce = 0.9 - (0.4 * progress)
-
-        # Temperature regulation based on loss stability
-        if train_loss < 0.5 and val_acc > 0.7:
-            new_temperature = max(2.0, self.temperature - 0.1)  # Sharper targets
-        else:
-            new_temperature = min(4.0, self.temperature + 0.05)  # Softer targets
-
-        return new_alpha_ce, new_temperature
-
-    def train_epoch(self, train_loader: DataLoader) -> Tuple[float, float, float]:
-        """Enhanced training with better stability"""
+            self.alpha = min(0.8, self.alpha + 0.03)
+            self.temperature = min(4.0, self.temperature + 0.1)
+    
+    def train_epoch(self, loader):
         self.model.train()
-        total_loss, total_ce_loss, total_distill_loss, n = 0, 0, 0, 0
-
+        for t in self.teachers.teachers.values(): t.classifier.train()
+        
+        total_loss, n = 0.0, 0
         self.optimizer.zero_grad()
-
-        for batch_idx, (texts, input_ids, labels) in enumerate(train_loader):
-            input_ids, labels = input_ids.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
-
-            # Forward pass with mixed precision
+        if self.teacher_opt: self.teacher_opt.zero_grad()
+        
+        for batch_idx, (texts, input_ids, labels) in enumerate(loader):
+            input_ids = input_ids.to(self.device)
+            labels = labels.to(self.device)
+            
             if self.use_amp:
                 with torch.amp.autocast('cuda'):
-                    student_logits = self.model(input_ids)
-                    teacher_probs = self.multi_teacher(texts)
-
+                    logits = self.model(input_ids)
+                    teacher_probs = self.teachers(texts)
+                    
                     if teacher_probs is not None:
-                        loss, ce_loss, distill_loss = self.distillation_loss(
-                            student_logits, teacher_probs, labels, self.alpha_ce, self.temperature
-                        )
+                        loss, _, _ = self.loss_fn(logits, teacher_probs, labels, self.alpha, self.temperature)
                     else:
-                        ce_loss = self.distillation_loss.ce_loss(student_logits, labels)
-                        loss = ce_loss
-                        distill_loss = torch.tensor(0.0, device=self.device)
-
-                    loss = loss / self.gradient_accumulation_steps
-                    self.scaler.scale(loss).backward()
+                        loss = F.cross_entropy(logits, labels)
+                    loss = loss / self.grad_accum
+                self.scaler.scale(loss).backward()
             else:
-                student_logits = self.model(input_ids)
-                teacher_probs = self.multi_teacher(texts)
-
+                logits = self.model(input_ids)
+                teacher_probs = self.teachers(texts)
+                
                 if teacher_probs is not None:
-                    loss, ce_loss, distill_loss = self.distillation_loss(
-                        student_logits, teacher_probs, labels, self.alpha_ce, self.temperature
-                    )
+                    loss, _, _ = self.loss_fn(logits, teacher_probs, labels, self.alpha, self.temperature)
                 else:
-                    ce_loss = self.distillation_loss.ce_loss(student_logits, labels)
-                    loss = ce_loss
-                    distill_loss = torch.tensor(0.0, device=self.device)
-
-                loss = loss / self.gradient_accumulation_steps
+                    loss = F.cross_entropy(logits, labels)
+                loss = loss / self.grad_accum
                 loss.backward()
-
-            # Gradient accumulation
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+            
+            if (batch_idx + 1) % self.grad_accum == 0:
                 if self.use_amp:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -348,319 +469,145 @@ class EnhancedLampreiaTrainer:
                 else:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
-
-                self.scheduler.step()
+                
+                if self.teacher_opt:
+                    self.teacher_opt.step()
+                    self.teacher_opt.zero_grad()
+                if self.scheduler: self.scheduler.step()
                 self.optimizer.zero_grad()
-
-            total_loss += loss.item() * input_ids.size(0) * self.gradient_accumulation_steps
-            total_ce_loss += ce_loss.item() * input_ids.size(0)
-            total_distill_loss += distill_loss.item() * input_ids.size(0)
+            
+            total_loss += loss.item() * input_ids.size(0) * self.grad_accum
             n += input_ids.size(0)
-
-            if batch_idx % 20 == 0:
-                current_lr = self.scheduler.get_last_lr()[0]
-                logging.info(f"  Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f} | LR: {current_lr:.2e}")
-
-        return total_loss / n, total_ce_loss / n, total_distill_loss / n
-
-    def validate(self, val_loader: DataLoader) -> float:
-        """Enhanced validation with confidence metrics"""
+            
+            if batch_idx % 100 == 0:
+                logging.info(f"  Batch {batch_idx}/{len(loader)} | Loss: {loss.item()*self.grad_accum:.4f}")
+        
+        return total_loss / n
+    
+    @torch.no_grad()
+    def validate(self, loader):
         self.model.eval()
         correct, total = 0, 0
-        all_probs = []
-        all_labels = []
-
-        with torch.no_grad():
-            for texts, input_ids, labels in val_loader:
-                input_ids, labels = input_ids.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
-                logits = self.model(input_ids)
-                probs = F.softmax(logits, dim=-1)
-                preds = logits.argmax(-1)
-                
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-                
-                all_probs.extend(probs.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-
-        accuracy = correct / total
         
-        # Calculate confidence metrics
-        all_probs = np.array(all_probs)
-        all_labels = np.array(all_labels)
-        max_probs = np.max(all_probs, axis=1)
-        avg_confidence = np.mean(max_probs)
+        for texts, input_ids, labels in loader:
+            input_ids = input_ids.to(self.device)
+            labels = labels.to(self.device)
+            preds = self.model(input_ids).argmax(dim=-1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
         
-        logging.info(f"  Validation - Accuracy: {accuracy:.4f}, Avg Confidence: {avg_confidence:.4f}")
+        return correct / total
+    
+    def train(self, train_loader, val_loader):
+        # FIXED: Calculate steps_per_epoch dynamically
+        steps_per_epoch = len(train_loader) // self.grad_accum
+        self.setup_scheduler(steps_per_epoch)
         
-        return accuracy
-
-    def train(self, train_loader: DataLoader, val_loader: DataLoader, task: str) -> Dict[str, Any]:
-        """Enhanced training loop"""
-        logging.info("="*80)
-        logging.info(f"STARTING ENHANCED ΨQRH LAMPREIA 3.1 TRAINING ON {task.upper()}")
-        logging.info(f"Initial α_CE: {self.alpha_ce}, Initial T: {self.temperature}")
-        logging.info(f"OneCycle LR Scheduler: ENABLED")
-        logging.info("="*80)
-
+        logging.info("="*70)
+        logging.info(f"TRAINING: {self.epochs} epochs, batch={train_loader.batch_size}, accum={self.grad_accum}")
+        logging.info(f"Steps per epoch: {steps_per_epoch}")
+        logging.info("="*70)
+        
         for epoch in range(self.epochs):
-            epoch_start = time.time()
-            GPUOptimizer.clear_gpu_cache()
-
-            # Train
-            train_loss, train_ce_loss, train_distill_loss = self.train_epoch(train_loader)
-
-            # Validate
-            val_acc = self.validate(val_loader)
-
-            # Enhanced parameter regulation
-            quality_metrics = {
-                'val_accuracy': val_acc,
-                'train_loss': train_loss,
-                'train_ce_loss': train_ce_loss,
-                'train_distill_loss': train_distill_loss,
-            }
+            t0 = time.time()
+            GPUOptimizer.clear_cache()
             
-            if epoch < self.epochs - 1:
-                self.alpha_ce, self.temperature = self.enhanced_auto_regulate(quality_metrics)
-
-            current_lr = self.scheduler.get_last_lr()[0]
-
-            # Update history
+            train_loss = self.train_epoch(train_loader)
+            val_acc = self.validate(val_loader)
+            self.adjust_params(val_acc)
+            
             self.history['epoch'].append(epoch + 1)
             self.history['train_loss'].append(train_loss)
-            self.history['train_ce_loss'].append(train_ce_loss)
-            self.history['train_distill_loss'].append(train_distill_loss)
-            self.history['val_accuracy'].append(val_acc)
-            self.history['alpha_ce'].append(self.alpha_ce)
-            self.history['temperature'].append(self.temperature)
-            self.history['lr'].append(current_lr)
-
-            # Early stopping and checkpointing
+            self.history['val_acc'].append(val_acc)
+            self.history['alpha'].append(self.alpha)
+            self.history['temp'].append(self.temperature)
+            
             if val_acc > self.best_acc:
                 self.best_acc = val_acc
                 self.patience_counter = 0
-                self.best_model_state = self.model.state_dict().copy()
-
-                best_path = f'enhanced_lampreia_v3_{task}_best.pth'
-                torch.save(self.best_model_state, best_path)
-                logging.info(f"✓ New best model saved: {best_path} (Acc: {val_acc:.4f})")
+                self.best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                torch.save(self.best_state, 'best_model.pth')
+                logging.info(f"  * Best model saved: {val_acc:.4f}")
             else:
                 self.patience_counter += 1
-
-            epoch_time = time.time() - epoch_start
-
-            logging.info("="*80)
-            logging.info(f"EPOCH {epoch+1}/{self.epochs} COMPLETED")
-            logging.info(f"  Train Loss:     {train_loss:.4f} (CE: {train_ce_loss:.4f}, Distill: {train_distill_loss:.4f})")
-            logging.info(f"  Val Accuracy:   {val_acc:.4f} (Best: {self.best_acc:.4f})")
-            logging.info(f"  Learning Rate:  {current_lr:.2e}")
-            logging.info(f"  Epoch Time:     {epoch_time:.2f}s")
-            logging.info(f"  Current Weights: α_CE={self.alpha_ce:.3f}, T={self.temperature:.3f}")
-            logging.info(f"  Early Stopping: {self.patience_counter}/{self.patience}")
-            logging.info("="*80 + "\n")
-
+            
+            logging.info("="*70)
+            logging.info(f"Epoch {epoch+1}/{self.epochs} | {time.time()-t0:.1f}s")
+            logging.info(f"  Loss: {train_loss:.4f} | Val Acc: {val_acc:.4f} (Best: {self.best_acc:.4f})")
+            logging.info(f"  Alpha: {self.alpha:.3f} | Temp: {self.temperature:.2f}")
+            logging.info(f"  Early stop: {self.patience_counter}/{self.patience}")
+            logging.info("="*70)
+            
             if self.patience_counter >= self.patience:
-                logging.info(f"Early stopping triggered after {epoch+1} epochs")
+                logging.info("Early stopping triggered!")
                 break
+        
+        if self.best_state:
+            self.model.load_state_dict(self.best_state)
+        
+        return {'best_accuracy': self.best_acc, 'epochs': len(self.history['epoch']), 'history': self.history}
 
-        # Load best model
-        if self.best_model_state is not None:
-            self.model.load_state_dict(self.best_model_state)
-            logging.info(f"✓ Loaded best model (Val Acc: {self.best_acc:.4f})")
 
-        return {
-            'best_accuracy': self.best_acc,
-            'final_alpha_ce': self.alpha_ce,
-            'final_temperature': self.temperature,
-            'epochs_trained': len(self.history['epoch']),
-            'history': self.history
-        }
-
-# =============================================================================
-# ENHANCED DATA PROCESSING
-# =============================================================================
-
-def build_enhanced_dataset(task: str, split: str, max_samples: Optional[int] = None) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
-    """Enhanced dataset building with better preprocessing"""
-    logging.info(f"Loading ENHANCED {task} dataset (split: {split})...")
-
-    try:
-        ds = load_dataset("glue", task, split=split)
-        logging.info(f"✓ Loaded {len(ds)} samples from HuggingFace")
-    except Exception as e:
-        logging.error(f"Failed to load dataset: {e}")
-        raise
-
-    logging.info("Initializing enhanced tokenizer...")
-    try:
-        tok = GPT2Tokenizer.from_pretrained("gpt2")
-        tok.pad_token = tok.eos_token
-        # Add special tokens for better processing
-        if tok.sep_token is None:
-            tok.add_special_tokens({'sep_token': '[SEP]'})
-    except Exception as e:
-        logging.error(f"Failed to load tokenizer: {e}")
-        raise
-
-    texts, labels = [], []
-
-    for idx, item in enumerate(ds):
-        if max_samples is not None and idx >= max_samples:
-            break
-
-        if task == "sst2":
-            text = item["sentence"].strip()
-            # Basic text cleaning
-            text = ' '.join(text.split())  # Normalize whitespace
-            texts.append(text)
-            labels.append(item["label"])
-        else:
-            # Handle other GLUE tasks
-            texts.append(item.get("sentence", str(item)))
-            labels.append(item["label"])
-
-    def enhanced_encode(text):
-        # Enhanced encoding with attention to special tokens
-        encoded = tok.encode(text, add_special_tokens=True, max_length=128, truncation=True)
-        # Pad to fixed length
-        if len(encoded) < 128:
-            encoded = encoded + [tok.pad_token_id] * (128 - len(encoded))
-        else:
-            encoded = encoded[:128]
-        return encoded
-
-    logging.info(f"Enhanced encoding {len(texts)} samples...")
-    input_ids = torch.tensor([enhanced_encode(t) for t in texts])
-    labels = torch.tensor(labels)
-
-    logging.info(f"Enhanced dataset built: {input_ids.shape[0]} samples")
-    return texts, input_ids, labels
-
-# =============================================================================
-# MAIN EXECUTION WITH ENHANCED PIPELINE
-# =============================================================================
-
-def main_enhanced():
-    """Enhanced main execution with better pipeline"""
+def main():
+    parser = argparse.ArgumentParser(description='Multi-Teacher Knowledge Distillation')
+    parser.add_argument('--params', type=float, default=10.5, help='Target params in millions')
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--lr', type=float, default=3e-5)
+    parser.add_argument('--train-samples', type=int, default=None)
+    parser.add_argument('--val-samples', type=int, default=None)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--teachers', nargs='+', default=['gpt2', 'distilbert', 'roberta'])
+    args = parser.parse_args()
     
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler('enhanced_lampreia_v3_training.log')
-        ],
-        force=True
-    )
-
-    print("\n" + "=" * 80)
-    print("ENHANCED ΨQRH LAMPREIA 3.1 - OPTIMIZED MULTI-TEACHER DISTILLATION")
-    print("=" * 80)
-    print("ENHANCED INITIALIZATION + ONE CYCLE LR + CONFIDENCE WEIGHTING")
-    print("TARGET: >75% SST-2 ACCURACY WITH OPTIMIZED TRAINING")
-    print("=" * 80 + "\n")
-
-    # GPU setup
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-        logging.info("✓ CUDA ENABLED")
-        gpu_info = GPUOptimizer.gpu_memory_info()
-        for gpu_id, info in gpu_info.items():
-            if isinstance(info, dict):
-                logging.info(f"{gpu_id}: {info['name']} ({info['total_memory_gb']:.1f} GB)")
-    else:
-        device = torch.device('cpu')
-        logging.error("✗ CUDA NOT AVAILABLE")
-        sys.exit(1)
-
-    # Enhanced multi-teacher system
-    multi_teacher = EnhancedMultiTeacherExtractor(device)
-
-    # Enhanced student model
-    task = 'sst2'
-    model = EnhancedLampreiaStudentModel(
-        vocab_size=50257,
-        d_model=384,
-        n_layers=4,
-        num_classes=2,
-        max_seq_len=128,
-        device=device
-    )
-
-    model = GPUOptimizer.optimize_model_for_gpu(model)
-
-    # Optional compilation
-    if hasattr(torch, 'compile'):
-        try:
-            model = torch.compile(model)
-            logging.info("✓ Model compiled with torch.compile")
-        except Exception as e:
-            logging.warning(f"Model compilation failed: {e}")
-
-    # Enhanced training setup
-    distillation_loss = LampreiaDistillationLoss(device)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
+                        handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler('training.log')])
     
-    trainer = EnhancedLampreiaTrainer(
-        model=model,
-        multi_teacher=multi_teacher,
-        distillation_loss=distillation_loss,
-        device=device,
-        lr=3e-5,
-        epochs=20,
-        patience=5,
-        gradient_accumulation_steps=4
-    )
-
-    # Enhanced data loading
-    logging.info("\n[1/3] Loading enhanced training data...")
-    train_texts, train_x, train_y = build_enhanced_dataset(task, "train", max_samples=15000)
-
-    logging.info("\n[2/3] Loading enhanced validation data...")
-    val_texts, val_x, val_y = build_enhanced_dataset(task, "validation", max_samples=500)
-
-    train_loader = DataLoader(
-        list(zip(train_texts, train_x, train_y)),
-        batch_size=32,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=2
-    )
-    val_loader = DataLoader(
-        list(zip(val_texts, val_x, val_y)),
-        batch_size=32,
-        pin_memory=True
-    )
-
-    # Enhanced training
-    logging.info("\n[3/3] Starting enhanced training...")
-    results = trainer.train(train_loader, val_loader, task)
-
-    # Save results
-    with open(f'enhanced_lampreia_v3_{task}_history.json', 'w') as f:
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(args.seed)
+    
+    print("\n" + "="*70)
+    print("MULTI-TEACHER KNOWLEDGE DISTILLATION - SST-2")
+    print(f"Target: ~{args.params}M parameters | Teachers: {args.teachers}")
+    print("="*70 + "\n")
+    
+    device = GPUOptimizer.get_device()
+    logging.info(f"Device: {device}")
+    if device.type == 'cuda':
+        info = GPUOptimizer.memory_info()
+        logging.info(f"  GPU: {info['device']} ({info['total_gb']:.1f} GB)")
+    
+    config = ModelConfig.from_param_count(args.params)
+    logging.info(f"Config: d={config.d_model}, layers={config.n_layers}, heads={config.n_heads}")
+    
+    model = StudentModel(config).to(device)
+    teachers = TeacherEnsemble(device, args.teachers)
+    
+    train_texts, train_ids, train_labels = load_sst2_data('train', args.train_samples)
+    val_texts, val_ids, val_labels = load_sst2_data('validation', args.val_samples)
+    
+    train_loader = DataLoader(SST2Dataset(train_texts, train_ids, train_labels), 
+                              batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(SST2Dataset(val_texts, val_ids, val_labels),
+                            batch_size=args.batch_size, num_workers=2, pin_memory=True)
+    
+    trainer = Trainer(model, teachers, device, lr=args.lr, epochs=args.epochs)
+    results = trainer.train(train_loader, val_loader)
+    
+    with open('history.json', 'w') as f:
         json.dump(results['history'], f, indent=2)
+    
+    print("\n" + "="*70)
+    print(f"COMPLETED! Best Accuracy: {results['best_accuracy']:.4f} ({results['best_accuracy']*100:.2f}%)")
+    print(f"Model saved: best_model.pth | History: history.json")
+    print("="*70 + "\n")
+    
+    return results
 
-    # Final report
-    print(f"\n{'='*80}")
-    print("ENHANCED ΨQRH LAMPREIA 3.1 TRAINING COMPLETED")
-    print(f"{'='*80}")
-    print(f"Task: {task.upper()}")
-    print(f"Best Validation Accuracy: {results['best_accuracy']:.4f}")
-    print(f"Final α_CE: {results['final_alpha_ce']:.3f}")
-    print(f"Final Temperature: {results['final_temperature']:.3f}")
-    print(f"Epochs Trained: {results['epochs_trained']}")
-    print(f"Model Saved: enhanced_lampreia_v3_{task}_best.pth")
-    print(f"{'='*80}\n")
-
-    logging.info("✓ ENHANCED ΨQRH LAMPREIA 3.1 TRAINING COMPLETED SUCCESSFULLY")
 
 if __name__ == "__main__":
-    # Import the original classes (you'll need to keep the original implementations)
-    from lampreia8 import (
-        GPUOptimizer, SemanticTeacher, GPT2TeacherWithHead, 
-        DistilBERTTeacherWithHead, RoBERTaTeacherWithHead,
-        LampreiaDistillationLoss, SpectralAttentionGPU,
-        MathematicalEmbeddingSystem
-    )
-    
-    main_enhanced()
+    if not HAS_HF:
+        print("Install dependencies: pip install transformers datasets")
+        sys.exit(1)
+    main()
